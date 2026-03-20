@@ -1,0 +1,307 @@
+-- LethalHub Auto Steal Core (Extracted)
+-- Supports: Nearest, Highest Gen, Priority List, Instant Steal
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Workspace = game:GetService("Workspace")
+local LocalPlayer = Players.LocalPlayer
+
+-- Config
+local stealNearestEnabled  = false
+local stealHighestEnabled  = true   -- default: steal highest gen
+local stealPriorityEnabled = false
+local instantStealEnabled  = false  -- set true for instant steal mode
+local autoStealEnabled     = true
+
+local STEAL_DURATION        = 1.2
+local INSTANT_STEAL_RADIUS  = 60
+local INSTANT_STEAL_COOLDOWN = 0.04
+
+-- Priority list (highest priority first)
+local PRIORITY_LIST = {
+    "Strawberry Elephant", "Meowl", "Skibidi Toilet", "Headless Horseman",
+    "Dragon Gingerini", "Dragon Cannelloni", "Ketupat Bros",
+    "Hydra Dragon Cannelloni", "La Supreme Combinasion", "Love Love Bear",
+    "Ginger Gerat", "Cerberus", "Capitano Moby", "La Casa Boo",
+    "Burguro and Fryuro", "Spooky and Pumpky", "Cooki and Milki",
+    "Rosey and Teddy", "Popcuru and Fizzuru", "Reinito Sleighito",
+    "Fragrama and Chocrama", "Garama and Madundung", "Ketchuru and Musturu",
+    "La Secret Combinasion", "Tralaledon", "Tictac Sahur",
+    "Ketupat Kepat", "Tang Tang Keletang", "Orcaledon",
+    "La Ginger Sekolah", "Los Spaghettis", "Lavadorito Spinito",
+    "Swaggy Bros", "La Taco Combinasion", "Los Primos",
+    "Chillin Chili", "Tuff Toucan", "W or L", "Chipso and Queso"
+}
+
+-- Internal caches
+local allAnimalsCache     = {}
+local PromptMemoryCache   = {}
+local InternalStealCache  = {}
+local selectedTargetIndex = 1
+local lastInstantStealTime = 0
+local activeProgressTween  = nil
+local currentStealTargetUID = nil
+
+-- Get Synchronizer
+local Synchronizer = require(ReplicatedStorage:WaitForChild("Packages"):WaitForChild("Synchronizer"))
+local AnimalsData  = require(ReplicatedStorage:WaitForChild("Shared"):WaitForChild("Animals"))
+
+local function isMyBaseAnimal(animalData)
+    if not animalData or not animalData.plot then return false end
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then return false end
+    local plot = plots:FindFirstChild(animalData.plot)
+    if not plot then return false end
+    local ch = Synchronizer:Get(plot.Name)
+    if ch then
+        local owner = ch:Get("Owner")
+        if owner then
+            if typeof(owner) == "Instance" and owner:IsA("Player") then return owner.UserId == LocalPlayer.UserId end
+            if typeof(owner) == "table" and owner.UserId then return owner.UserId == LocalPlayer.UserId end
+        end
+    end
+    return false
+end
+
+local function get_all_pets()
+    local out = {}
+    for _, a in ipairs(allAnimalsCache) do
+        if a.genValue >= 1 and not isMyBaseAnimal(a) then
+            table.insert(out, {
+                petName  = a.name,
+                mpsText  = a.genText,
+                mpsValue = a.genValue,
+                owner    = a.owner,
+                plot     = a.plot,
+                slot     = a.slot,
+                uid      = a.uid,
+                mutation = a.mutation,
+                animalData = a
+            })
+        end
+    end
+    return out
+end
+
+-- Find the steal ProximityPrompt for a given animal
+local function findProximityPromptForAnimal(animalData)
+    if not animalData then return nil end
+    local cp = PromptMemoryCache[animalData.uid]
+    if cp and cp.Parent then return cp end
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then return nil end
+    local plot = plots:FindFirstChild(animalData.plot)
+    if not plot then return nil end
+    local podiums = plot:FindFirstChild("AnimalPodiums")
+    if not podiums then return nil end
+    local podium = podiums:FindFirstChild(animalData.slot)
+    if not podium then return nil end
+    local base  = podium:FindFirstChild("Base")
+    local spawn = base and base:FindFirstChild("Spawn")
+    if not spawn then return nil end
+
+    local attach = spawn:FindFirstChild("PromptAttachment")
+    if attach then
+        for _, p in ipairs(attach:GetChildren()) do
+            if p:IsA("ProximityPrompt") and p.Enabled and p.ActionText == "Steal" then
+                PromptMemoryCache[animalData.uid] = p
+                return p
+            end
+        end
+    end
+
+    -- Fallback: search whole plot
+    local startPos = spawn.Position
+    local nearestPrompt, minDist = nil, math.huge
+    for _, desc in pairs(plot:GetDescendants()) do
+        if desc:IsA("ProximityPrompt") and desc.Enabled and desc.ActionText == "Steal" then
+            local part = desc.Parent
+            local pos  = (part and part:IsA("BasePart") and part.Position)
+                      or (part and part:IsA("Attachment") and part.Parent and part.Parent:IsA("BasePart") and part.Parent.Position)
+            if pos then
+                local hDist = math.sqrt((pos.X - startPos.X)^2 + (pos.Z - startPos.Z)^2)
+                if hDist < 5 and pos.Y > startPos.Y then
+                    local yDist = pos.Y - startPos.Y
+                    if yDist < minDist then minDist = yDist; nearestPrompt = desc end
+                end
+            end
+        end
+    end
+    if nearestPrompt then PromptMemoryCache[animalData.uid] = nearestPrompt end
+    return nearestPrompt
+end
+
+-- Build internal callbacks from prompt signals
+local function buildStealCallbacks(prompt)
+    if InternalStealCache[prompt] then return end
+    local data = {holdCallbacks={}, triggerCallbacks={}, holdEndCallbacks={}, ready=true}
+    local function grabConns(signal, tbl)
+        local ok, conns = pcall(getconnections, signal)
+        if ok and type(conns) == "table" then
+            for _, c in ipairs(conns) do
+                if type(c.Function) == "function" then table.insert(tbl, c.Function) end
+            end
+        end
+    end
+    grabConns(prompt.PromptButtonHoldBegan,  data.holdCallbacks)
+    grabConns(prompt.Triggered,              data.triggerCallbacks)
+    grabConns(prompt.PromptButtonHoldEnded,  data.holdEndCallbacks)
+    if #data.holdCallbacks > 0 or #data.triggerCallbacks > 0 or #data.holdEndCallbacks > 0 then
+        InternalStealCache[prompt] = data
+    end
+end
+
+-- Instant steal (bypasses hold duration)
+local function executeInstantSteal(prompt)
+    if not prompt then return end
+    local now = os.clock()
+    if now - lastInstantStealTime < INSTANT_STEAL_COOLDOWN then return end
+    lastInstantStealTime = now
+    buildStealCallbacks(prompt)
+    local data = InternalStealCache[prompt]
+    if not data then return end
+    local oDur = prompt.HoldDuration
+    prompt.HoldDuration = 0
+    for _, fn in ipairs(data.holdCallbacks)    do pcall(fn) end
+    for _rep = 1, 6 do
+        for _, fn in ipairs(data.triggerCallbacks) do pcall(fn) end
+        if fireproximityprompt then fireproximityprompt(prompt) end
+    end
+    for _, fn in ipairs(data.holdEndCallbacks) do pcall(fn) end
+    prompt.HoldDuration = oDur
+end
+
+-- Normal steal (holds the prompt for STEAL_DURATION)
+local function attemptSteal(prompt, animalUID)
+    if not prompt or not prompt.Parent then return end
+    buildStealCallbacks(prompt)
+    local data = InternalStealCache[prompt]
+    if not data or not data.ready then return end
+    data.ready = false
+    task.spawn(function()
+        for _, fn in ipairs(data.holdCallbacks) do task.spawn(fn) end
+        task.wait(STEAL_DURATION)
+        if currentStealTargetUID == animalUID then
+            for _, fn in ipairs(data.triggerCallbacks) do task.spawn(fn) end
+        end
+        data.ready = true
+    end)
+    currentStealTargetUID = animalUID
+end
+
+-- Nearest prompt finder for instant steal mode
+local function isMyPlot_Instant(plotName)
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then return false end
+    local plot = plots:FindFirstChild(plotName)
+    local sign = plot and plot:FindFirstChild("PlotSign")
+    local yb   = sign and sign:FindFirstChild("YourBase")
+    return yb and yb:IsA("BillboardGui") and yb.Enabled
+end
+
+local function findNearestPrompt_Instant()
+    local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not hrp then return nil, math.huge end
+    local plots = Workspace:FindFirstChild("Plots")
+    if not plots then return nil, math.huge end
+    local bestPrompt, bestDist = nil, math.huge
+    for _, plot in ipairs(plots:GetChildren()) do
+        if isMyPlot_Instant(plot.Name) then continue end
+        local podiums = plot:FindFirstChild("AnimalPodiums")
+        if not podiums then continue end
+        for _, pod in ipairs(podiums:GetChildren()) do
+            local base  = pod:FindFirstChild("Base")
+            local spawn = base and base:FindFirstChild("Spawn")
+            if not spawn then continue end
+            local dist = (spawn.Position - hrp.Position).Magnitude
+            if dist > INSTANT_STEAL_RADIUS or dist >= bestDist then continue end
+            local att = spawn:FindFirstChild("PromptAttachment")
+            if not att then continue end
+            local prompt = att:FindFirstChildOfClass("ProximityPrompt")
+            if prompt and prompt.Parent and prompt.Enabled then
+                bestPrompt = prompt; bestDist = dist
+            end
+        end
+    end
+    return bestPrompt, bestDist
+end
+
+-- ============ TARGET SELECTION LOOP ============
+task.spawn(function()
+    while task.wait(0.5) do
+        if not autoStealEnabled then continue end
+        local pets = get_all_pets()
+        if #pets == 0 then continue end
+        local function applySelection(newIndex)
+            if newIndex and newIndex >= 1 and newIndex <= #pets then
+                selectedTargetIndex = newIndex
+            end
+        end
+        if stealPriorityEnabled then
+            local found = nil
+            for _, pName in ipairs(PRIORITY_LIST) do
+                for i, p in ipairs(pets) do
+                    if p.petName and p.petName:lower() == pName:lower() then found = i; break end
+                end
+                if found then break end
+            end
+            applySelection(found or 1)
+        elseif stealNearestEnabled then
+            local hrp = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                local bestIndex, bestDist = nil, math.huge
+                for i, p in ipairs(pets) do
+                    local plotsF = Workspace:FindFirstChild("Plots")
+                    local plotF  = plotsF and plotsF:FindFirstChild(p.plot)
+                    local pods   = plotF and plotF:FindFirstChild("AnimalPodiums")
+                    local pod    = pods and pods:FindFirstChild(p.slot)
+                    local base   = pod and pod:FindFirstChild("Base")
+                    local spawn  = base and base:FindFirstChild("Spawn")
+                    if spawn then
+                        local d = (hrp.Position - spawn.Position).Magnitude
+                        if d < bestDist then bestDist = d; bestIndex = i end
+                    end
+                end
+                applySelection(bestIndex or 1)
+            end
+        elseif stealHighestEnabled then
+            applySelection(1) -- already sorted by gen value descending
+        end
+    end
+end)
+
+-- ============ MAIN STEAL LOOP ============
+RunService.Heartbeat:Connect(function()
+    if not autoStealEnabled then return end
+    if instantStealEnabled then
+        if stealNearestEnabled then
+            local prompt, dist = findNearestPrompt_Instant()
+            if prompt and dist <= INSTANT_STEAL_RADIUS then executeInstantSteal(prompt) end
+        else
+            local pets = get_all_pets()
+            if #pets == 0 then return end
+            selectedTargetIndex = math.clamp(selectedTargetIndex, 1, #pets)
+            local tp = pets[selectedTargetIndex]
+            if tp and not isMyBaseAnimal(tp.animalData) then
+                local pr = PromptMemoryCache[tp.uid]
+                if not pr or not pr.Parent then pr = findProximityPromptForAnimal(tp.animalData) end
+                if pr then executeInstantSteal(pr) end
+            end
+        end
+        return
+    end
+    -- Normal hold steal
+    local pets = get_all_pets()
+    if #pets == 0 then return end
+    selectedTargetIndex = math.clamp(selectedTargetIndex, 1, #pets)
+    local tp = pets[selectedTargetIndex]
+    if not tp or isMyBaseAnimal(tp.animalData) then return end
+    local pr = PromptMemoryCache[tp.uid]
+    if not pr or not pr.Parent then pr = findProximityPromptForAnimal(tp.animalData) end
+    if pr then attemptSteal(pr, tp.uid) end
+end)
+
+print("LethalHub Auto Steal Loaded!")
+print("Mode: " .. (instantStealEnabled and "INSTANT" or "NORMAL HOLD"))
+print("Targeting: " .. (stealHighestEnabled and "HIGHEST GEN" or stealNearestEnabled and "NEAREST" or "PRIORITY LIST"))
